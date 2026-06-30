@@ -2543,7 +2543,7 @@ document.getElementById('btnDlEverything').addEventListener('click', async () =>
   for (const cfg of FIXED_AIR_CARRIERS) {
     const html = state.processed.outreach[cfg.display];
     zip.file(`Outreach_${safeName(cfg.display)}_Week${state.weekNumber}.docx`,
-      await htmlToDocx(html).arrayBuffer());
+      await (await htmlToDocx(html)).arrayBuffer());
   }
   const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
   triggerDownload(blob, `AstraZeneca_AIR_DataQuality_Bundle_Week${state.weekNumber}.zip`);
@@ -2560,53 +2560,171 @@ function triggerDownload(blob, name) {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SHARED — htmlToDocx
-// Converts an HTML string (outreach body) to a Word-compatible MHTML blob.
-// Output filename should end in .docx — Word opens this natively.
-// Supports: <p>, <strong>, <b>, <table>, <thead>, <tbody>, <tr>, <th>, <td>
-// Table header rows automatically receive light-blue shading (#BDD7EE) per SOP.
+// Builds a GENUINE Office Open XML (.docx) binary — a real ZIP package with
+// word/document.xml inside — using JSZip (already loaded in this hub).
+// This is NOT the MHTML-as-Word trick; it opens reliably on every machine,
+// including managed/corporate Word installs with strict file-validation policies.
+// Supports: <p>, <strong>, <b>, <table>, <thead>, <tbody>, <tr>, <th>, <td>.
+// Table header rows automatically receive light-blue shading (BDD7EE) per SOP.
+// Returns a Promise<Blob> — call sites already use `await htmlToDocx(...)`.
 // ═══════════════════════════════════════════════════════════════════════════════
-function htmlToDocx(htmlBody) {
-  const wordHtml = `<html xmlns:v="urn:schemas-microsoft-com:vml"
-xmlns:o="urn:schemas-microsoft-com:office:office"
-xmlns:w="urn:schemas-microsoft-com:office:word"
-xmlns:m="http://schemas.microsoft.com/office/2004/12/omml"
-xmlns="http://www.w3.org/TR/REC-html40">
-<head>
-<meta http-equiv=Content-Type content="text/html; charset=utf-8">
-<meta name=ProgId content=Word.Document>
-<meta name=Generator content="Microsoft Word 15">
-<!--[if gte mso 9]><xml>
- <w:WordDocument>
-  <w:View>Print</w:View>
-  <w:SpellingState>Clean</w:SpellingState>
-  <w:GrammarState>Clean</w:GrammarState>
-  <w:TrackMoves>false</w:TrackMoves>
-  <w:TrackFormatting/>
-  <w:ValidateAgainstSchemas/>
-  <w:SaveIfXMLInvalid>false</w:SaveIfXMLInvalid>
-  <w:IgnoreMixedContent>false</w:IgnoreMixedContent>
-  <w:Compatibility>
-   <w:BreakWrappedTables/>
-   <w:SnapToGridInCell/>
-   <w:WrapTextWithPunct/>
-   <w:UseAsianBreakRules/>
-   <w:DontGrowAutofit/>
-  </w:Compatibility>
- </w:WordDocument>
-</xml><![endif]-->
-<style>
- body{font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#0B1320;margin:40pt;line-height:1.5}
- p{margin:5pt 0}
- table{border-collapse:collapse;width:100%;margin:10pt 0;font-size:10pt}
- th,td{border:1px solid #000000;padding:5pt 7pt;text-align:center}
- th{background:#BDD7EE;font-weight:bold}
- strong,b{font-weight:bold}
-</style>
-</head>
-<body>${htmlBody}</body>
-</html>`;
-  return new Blob(['\uFEFF' + wordHtml], { type: 'application/msword;charset=utf-8' });
+async function htmlToDocx(htmlBody) {
+  const esc = s => String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+
+  // ── Parse the outreach HTML fragment into a simple block list ──────────────
+  const doc = new DOMParser().parseFromString(`<div>${htmlBody}</div>`, 'text/html');
+  const root = doc.body.firstElementChild;
+
+  function runsFromInline(node, runs = []) {
+    node.childNodes.forEach(n => {
+      if (n.nodeType === 3) {                       // text node
+        const t = n.textContent;
+        if (t) runs.push({ text: t, bold: false });
+      } else if (n.nodeType === 1) {
+        const tag = n.tagName.toLowerCase();
+        if (tag === 'strong' || tag === 'b') {
+          n.childNodes.forEach(c => {
+            const t = c.textContent || '';
+            if (t) runs.push({ text: t, bold: true });
+          });
+        } else {
+          runsFromInline(n, runs);
+        }
+      }
+    });
+    return runs;
+  }
+
+  function runsToXml(runs) {
+    return runs.map(r => {
+      const boldTag = r.bold ? '<w:b/>' : '';
+      // preserve internal spacing exactly as authored
+      return `<w:r><w:rPr>${boldTag}<w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="22"/></w:rPr><w:t xml:space="preserve">${esc(r.text)}</w:t></w:r>`;
+    }).join('');
+  }
+
+  function paragraphXml(node) {
+    const runs = runsFromInline(node);
+    if (!runs.length) return '<w:p/>';
+    return `<w:p><w:pPr><w:spacing w:after="160"/></w:pPr>${runsToXml(runs)}</w:p>`;
+  }
+
+  function tableXml(tableNode) {
+    const rows = [...tableNode.querySelectorAll('tr')];
+    const colCount = Math.max(...rows.map(r => r.children.length), 1);
+    const colWidth = Math.floor(9360 / colCount); // ~6.5in usable width in twips/20
+    const gridCols = Array.from({length: colCount}, () => `<w:gridCol w:w="${colWidth}"/>`).join('');
+
+    const rowsXml = rows.map(tr => {
+      const isHeaderRow = tr.parentElement.tagName.toLowerCase() === 'thead' ||
+                           [...tr.children].every(c => c.tagName.toLowerCase() === 'th');
+      const cellsXml = [...tr.children].map(cell => {
+        const runs = runsFromInline(cell);
+        const cellRuns = runs.length ? runsToXml(runs.map(r => ({...r, bold: r.bold || isHeaderRow}))) :
+          '<w:r><w:t></w:t></w:r>';
+        const shade = isHeaderRow
+          ? '<w:shd w:val="clear" w:fill="BDD7EE"/>'
+          : '';
+        return `<w:tc><w:tcPr><w:tcW w:w="${colWidth}" w:type="dxa"/>${shade}<w:vAlign w:val="center"/></w:tcPr><w:p><w:pPr><w:jc w:val="center"/></w:pPr>${cellRuns}</w:p></w:tc>`;
+      }).join('');
+      return `<w:tr>${cellsXml}</w:tr>`;
+    }).join('');
+
+    return `<w:tbl>
+      <w:tblPr>
+        <w:tblStyle w:val="TableGrid"/>
+        <w:tblW w:w="9360" w:type="dxa"/>
+        <w:tblBorders>
+          <w:top w:val="single" w:sz="4" w:color="000000"/>
+          <w:left w:val="single" w:sz="4" w:color="000000"/>
+          <w:bottom w:val="single" w:sz="4" w:color="000000"/>
+          <w:right w:val="single" w:sz="4" w:color="000000"/>
+          <w:insideH w:val="single" w:sz="4" w:color="000000"/>
+          <w:insideV w:val="single" w:sz="4" w:color="000000"/>
+        </w:tblBorders>
+        <w:tblLayout w:type="fixed"/>
+      </w:tblPr>
+      <w:tblGrid>${gridCols}</w:tblGrid>
+      ${rowsXml}
+    </w:tbl>
+    <w:p/>`;
+  }
+
+  // ── Walk top-level children and build the document body XML ────────────────
+  let bodyXml = '';
+  (root ? [...root.children] : []).forEach(el => {
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'table') bodyXml += tableXml(el);
+    else if (tag === 'p' || tag === 'div') bodyXml += paragraphXml(el);
+    else bodyXml += paragraphXml(el); // fallback — treat unknown blocks as paragraphs
+  });
+  if (!bodyXml) bodyXml = paragraphXml(root || doc.body);
+
+  // ── Minimal valid OOXML package ─────────────────────────────────────────────
+  const documentXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    ${bodyXml}
+    <w:sectPr>
+      <w:pgSz w:w="12240" w:h="15840"/>
+      <w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/>
+    </w:sectPr>
+  </w:body>
+</w:document>`;
+
+  const contentTypesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+</Types>`;
+
+  const rootRelsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>`;
+
+  const docRelsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>`;
+
+  const stylesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:docDefaults>
+    <w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="22"/></w:rPr></w:rPrDefault>
+  </w:docDefaults>
+  <w:style w:type="table" w:styleId="TableGrid">
+    <w:name w:val="Table Grid"/>
+    <w:tblPr>
+      <w:tblBorders>
+        <w:top w:val="single" w:sz="4" w:color="000000"/>
+        <w:left w:val="single" w:sz="4" w:color="000000"/>
+        <w:bottom w:val="single" w:sz="4" w:color="000000"/>
+        <w:right w:val="single" w:sz="4" w:color="000000"/>
+        <w:insideH w:val="single" w:sz="4" w:color="000000"/>
+        <w:insideV w:val="single" w:sz="4" w:color="000000"/>
+      </w:tblBorders>
+    </w:tblPr>
+  </w:style>
+</w:styles>`;
+
+  const zip = new JSZip();
+  zip.file('[Content_Types].xml', contentTypesXml);
+  zip.file('_rels/.rels', rootRelsXml);
+  zip.file('word/document.xml', documentXml);
+  zip.file('word/_rels/document.xml.rels', docRelsXml);
+  zip.file('word/styles.xml', stylesXml);
+
+  return zip.generateAsync({
+    type: 'blob',
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  });
 }
+
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SHARED — Tracking Error Distribution Excel builder
@@ -4264,7 +4382,7 @@ document.getElementById('btnAzotrDlEverything')?.addEventListener('click', async
     zip.file(`${c.replace(/[^A-Za-z0-9]/g,'_')}_AstraZeneca_OTR_Week${week}.xlsx`, XLSX.write(wb, {type:'array', bookType:'xlsx', cellDates:true, compression:true}));
   }
   for (const c of AZOTR_CARRIERS){
-    zip.file(`Outreach_${c.replace(/[^A-Za-z0-9]/g,'_')}_Week${week}.docx`, await htmlToDocx(state.azotrProcessed.outreach[c]).arrayBuffer());
+    zip.file(`Outreach_${c.replace(/[^A-Za-z0-9]/g,'_')}_Week${week}.docx`, await (await htmlToDocx(state.azotrProcessed.outreach[c])).arrayBuffer());
   }
   const blob = await zip.generateAsync({type:'blob', compression:'DEFLATE'});
   triggerDownload(blob, `AstraZeneca_OTR_Bundle_Week${week}.zip`);
@@ -4585,7 +4703,7 @@ document.getElementById('btnAbftlDlEverything')?.addEventListener('click', async
     zip.file(abftlCarrierFilename(c, week), XLSX.write(buildAbftlWb(c),{type:'array',bookType:'xlsx',cellDates:true,compression:true}));
   }
   for (const c of ABFTL_CARRIERS){
-    zip.file(`Outreach_${c.replace(/[^A-Za-z0-9]/g,'_')}_Week${week}.docx`, await htmlToDocx(state.abftlProcessed.outreach[c]).arrayBuffer());
+    zip.file(`Outreach_${c.replace(/[^A-Za-z0-9]/g,'_')}_Week${week}.docx`, await (await htmlToDocx(state.abftlProcessed.outreach[c])).arrayBuffer());
   }
   const blob = await zip.generateAsync({type:'blob',compression:'DEFLATE'});
   triggerDownload(blob, `Abbott_FTL_Bundle_Week${week}.zip`);
@@ -4974,7 +5092,7 @@ document.getElementById('btnAbltlDlEverything')?.addEventListener('click', async
     zip.file(abltlCarrierFilename(c, week), XLSX.write(buildAbltlWb(c),{type:'array',bookType:'xlsx',cellDates:true,compression:true}));
   }
   for (const c of ABLTL_CARRIERS){
-    zip.file(`Outreach_${c.replace(/[^A-Za-z0-9]/g,'_')}_Week${week}.docx`, await htmlToDocx(state.abltlProcessed.outreach[c]).arrayBuffer());
+    zip.file(`Outreach_${c.replace(/[^A-Za-z0-9]/g,'_')}_Week${week}.docx`, await (await htmlToDocx(state.abltlProcessed.outreach[c])).arrayBuffer());
   }
   const blob = await zip.generateAsync({type:'blob',compression:'DEFLATE'});
   triggerDownload(blob, `Abbott_LTL_Bundle_Week${week}.zip`);
@@ -5432,7 +5550,7 @@ document.getElementById('btnCmxDlEverything')?.addEventListener('click', async (
     const rows = state.cmxProcessed.carrierGroups[c];
     if (!rows || rows.length === 0) continue;
     zip.file(`${c.replace(/[^A-Za-z0-9]/g,'_')}_Cemex_FTL_Week${week}.xlsx`, XLSX.write(buildCmxWb(c),{type:'array',bookType:'xlsx',cellDates:true,compression:true}));
-    if (state.cmxProcessed.outreach[c]) zip.file(`Outreach_${c.replace(/[^A-Za-z0-9]/g,'_')}_Week${week}.docx`, await htmlToDocx(state.cmxProcessed.outreach[c]).arrayBuffer());
+    if (state.cmxProcessed.outreach[c]) zip.file(`Outreach_${c.replace(/[^A-Za-z0-9]/g,'_')}_Week${week}.docx`, await (await htmlToDocx(state.cmxProcessed.outreach[c])).arrayBuffer());
   }
   const blob = await zip.generateAsync({type:'blob',compression:'DEFLATE'});
   triggerDownload(blob, `Cemex_FTL_Bundle_Week${week}.zip`);
@@ -5718,7 +5836,7 @@ document.getElementById('btnEastDlEverything')?.addEventListener('click', async 
     }
     if (state.eastProcessed.outreach[c]){
       const lang = eastmanLang(c).toUpperCase();
-      zip.file(`${lang}_${safe}_Outreach_Week${week}.docx`, await htmlToDocx(state.eastProcessed.outreach[c]).arrayBuffer());
+      zip.file(`${lang}_${safe}_Outreach_Week${week}.docx`, await (await htmlToDocx(state.eastProcessed.outreach[c])).arrayBuffer());
     }
   }
   const blob = await zip.generateAsync({type:'blob',compression:'DEFLATE'});
